@@ -25,7 +25,7 @@
             'runner-reg '(get-in @state [:runner :register])
             'target '(first targets)
             'installed '(#{:rig :servers} (first (:zone card)))
-            'remotes '(map #(str "Server " %) (range (count (get-in corp [:servers :remote]))))
+            'remotes '(get-remote-names @state)
             'servers '(concat ["HQ" "R&D" "Archives"] remotes)
             'tagged '(or (> (:tagged runner) 0) (> (:tag runner) 0))
             'this-server '(let [s (-> card :zone rest butlast)
@@ -42,5 +42,6 @@
             'runner-reg '(get-in @state [:runner :register])
             'run '(:run @state)
             'current-ice '(when (and run (> (or (:position run) 0) 0)) ((:ices run) (dec (:position run))))
-            'target '(first targets)]
+            'target '(first targets)
+            'tagged '(or (> (:tagged runner) 0) (> (:tag runner) 0))]
        (str ~@expr))))

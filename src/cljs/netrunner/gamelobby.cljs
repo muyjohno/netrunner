@@ -8,24 +8,45 @@
             [netrunner.auth :refer [authenticated avatar] :as auth]
             [netrunner.gameboard :refer [init-game game-state]]
             [netrunner.cardbrowser :refer [image-url] :as cb]
-            [netrunner.deckbuilder :refer [valid?]]))
+            [netrunner.deckbuilder :refer [deck-status-span deck-status-label]]))
 
 (def socket-channel (chan))
 (def socket (.connect js/io (str js/iourl "/lobby")))
 (.on socket "netrunner" #(put! socket-channel (js->clj % :keywordize-keys true)))
 
 (defn launch-game [game]
-  (let [side (if (= (get-in game [:runner :user]) (:user @app-state)) :runner :corp)]
+  (let [user (:user @app-state)
+        side (if (= (get-in game [:runner :user]) user)
+               :runner
+               (if (= (get-in game [:corp :user]) user)
+                 :corp
+                 :spectator))]
+    (swap! app-state assoc :side side)
     (init-game game side))
   (set! (.-onbeforeunload js/window) #(clj->js "Leaving this page will disconnect you from the game."))
   (-> "#gamelobby" js/$ .fadeOut)
   (-> "#gameboard" js/$ .fadeIn))
 
+(defn sort-games-list [games]
+  (sort-by #(vec (map (assoc % :started (not (:started %)))
+                      [:started :date]))
+           > games))
+
 (go (while true
       (let [msg (<! socket-channel)]
         (case (:type msg)
-          "game" (swap! app-state assoc :gameid (:gameid msg))
-          "games" (do (swap! app-state assoc :games (sort-by :date > (vals (:games msg))))
+          "game" (do (swap! app-state assoc :gameid (:gameid msg))
+                     (when (:started msg) (launch-game nil)))
+          "games" (do (when (:gamesdiff msg)
+                        (swap! app-state update-in [:games]
+                               (fn [games]
+                                 (let [gamemap (into {} (map #(assoc {} (keyword (:gameid %)) %) games))
+                                       create (merge gamemap (get-in msg [:gamesdiff :create]))
+                                       update (merge create (get-in msg [:gamesdiff :update]))
+                                       delete (apply dissoc update (map keyword (keys (get-in msg [:gamesdiff :delete]))))]
+                                   (sort-games-list (vals delete))))))
+                      (when (:games msg)
+                        (swap! app-state assoc :games (sort-games-list (vals (:games msg)))))
                       (when-let [sound (:notification msg)]
                         (when-not (:gameid @app-state)
                           (.play (.getElementById js/document sound)))))
@@ -44,8 +65,9 @@
   (authenticated
    (fn [user]
      (om/set-state! owner :title (str (:username user) "'s game"))
+     (om/set-state! owner :side "Corp")
      (om/set-state! owner :editing true)
-     (om/set-state! owner :allowspectator false)
+     (om/set-state! owner :allowspectator true)
      (-> ".game-title" js/$ .select))))
 
 (defn create-game [cursor owner]
@@ -56,7 +78,8 @@
        (do (om/set-state! owner :editing false)
            (swap! app-state assoc :messages [])
            (send {:action "create" :title (om/get-state owner :title)
-                  :allowspectator (om/get-state owner :allowspectator)}))))))
+                  :allowspectator (om/get-state owner :allowspectator)
+                  :side (om/get-state owner :side)}))))))
 
 (defn join-game [gameid owner]
   (authenticated
@@ -78,13 +101,18 @@
   (om/update! cursor :message []))
 
 (defn leave-game []
-  (send {:action "leave-game" :gameid (:gameid @app-state) :side (:side @game-state)})
+  (send {:action "leave-game" :gameid (:gameid @app-state)
+         :user (:user @app-state) :side (:side @game-state)})
   (reset! game-state nil)
-  (swap! app-state dissoc :gameid)
+  (swap! app-state dissoc :gameid :side)
   (.removeItem js/localStorage "gameid")
   (set! (.-onbeforeunload js/window) nil)
   (-> "#gameboard" js/$ .fadeOut)
   (-> "#gamelobby" js/$ .fadeIn))
+
+(defn concede []
+  (send {:action "concede" :gameid (:gameid @app-state)
+         :user (:user @app-state) :side (:side @game-state)}))
 
 (defn send-msg [event owner]
   (.preventDefault event)
@@ -110,8 +138,7 @@
           (for [deck (sort-by :date > (filter #(= (get-in % [:identity :side]) side) decks))]
             [:div.deckline {:on-click #(send {:action "deck" :gameid (:gameid @app-state) :deck deck})}
              [:img {:src (image-url (:identity deck))}]
-             (when-not (valid? deck)
-               [:div.float-right.invalid "Invalid deck"])
+             [:div.float-right (deck-status-span deck)]
              [:h4 (:name deck)]
              [:div.float-right (-> (:date deck) js/Date. js/moment (.format "MMM Do YYYY - HH:mm"))]
              [:p (get-in deck [:identity :title])]])])]]])))
@@ -172,7 +199,7 @@
                (when-not (or gameid (= (count (:players game)) 2) (:started game))
                  (let [id (:gameid game)]
                    [:button {:on-click #(join-game id owner)} "Join"]))
-               (when (and (:allowspectator game) (not gameid) (not (:started game)))
+               (when (and (:allowspectator game) (not gameid))
                  (let [id (:gameid game)]
                   [:button {:on-click #(watch-game id owner)} "Watch"]))
                (let [c (count (:spectators game))]
@@ -193,9 +220,15 @@
                                 :value (:title state) :placeholder "Title"}]
             [:p.flash-message (:flash-message state)]
             [:label
-             [:input {:type "checkbox"
+             [:input {:type "checkbox" :checked (om/get-state owner :allowspectator)
                       :on-change #(om/set-state! owner :allowspectator (.. % -target -checked))}]
-             "Allow spectators"]]
+             "Allow spectators"]
+            [:h4 "Side"]
+            (for [option ["Corp" "Runner"]] [:label [:input {:type "radio"
+                                                             :name "side"
+                                                             :value option
+                                                             :on-change #(om/set-state! owner :side (.. % -target -value))
+                                                             :checked (= (om/get-state owner :side) option)}] option])]
            (when-let [game (some #(when (= gameid (:gameid %)) %) games)]
              (let [players (:players game)]
                [:div
@@ -218,10 +251,13 @@
                     [:div
                      (om/build player-view player)
                      (when-let [deck (:deck player)]
-                       [:span.label
-                        (if (= (:user player) user)
-                          (:name deck)
-                          "Deck selected")])
+                       [:span {:class (deck-status-label deck)}
+                        [:span.label
+                         (if (= (:user player) user)
+                           (:name deck)
+                           "Deck selected")]])
+                     (when-let [deck (:deck player)]
+                       [:div.float-right (deck-status-span deck)])
                      (when (= (:user player) user)
                        [:span.fake-link.deck-load
                         {:data-target "#deck-select" :data-toggle "modal"} "Select deck"])])]
